@@ -8,10 +8,24 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+/**
+ * @title ZebraLiquidityNFT
+ * @notice This ERC721 contract represents Liquidity NFTs, each storing metadata about
+ *         the token address, amount of liquidity, and timestamps.
+ */
 contract ZebraLiquidityNFT is ERC721, Pausable, Ownable(msg.sender), ReentrancyGuard {
+    using Strings for uint256;
+
+    /// @notice NFT token ID counter
     uint256 private _nextTokenId;
 
-    // Struct to store token information in the NFT
+    /// @notice Precision for fee calculations or percentages
+    uint256 public constant FEE_DENOMINATOR = 1_000_000;
+
+    /// @notice Fee percentage (10,000 means 1% if / 1,000,000)
+    uint256 public FEE_PERCENTAGE = 10_000;
+
+    /// @dev Stores metadata about the underlying liquidity of each NFT
     struct LiquidityNFTInfo {
         address tokenAddress;
         uint256 amount;
@@ -19,86 +33,147 @@ contract ZebraLiquidityNFT is ERC721, Pausable, Ownable(msg.sender), ReentrancyG
         uint256 lastUpdatedTimestamp;
     }
 
-    // Mapping of NFT ID to Liquidity NFT Info
+    /// @dev Mapping of NFT ID to its Liquidity Info
     mapping(uint256 => LiquidityNFTInfo) public nftInfo;
 
+    /// @dev Emitted when NFT metadata is updated
+    event MetadataUpdated(uint256 indexed tokenId, uint256 newAmount);
+
+    /**
+     * @dev Sets up the NFT with a name and symbol.
+     */
     constructor() ERC721("Liquidity Provider NFT", "LP-NFT") {}
 
-    // Mint the NFT with token liquidity info
-    function mint(address to, address tokenAddress, uint256 amount) public whenNotPaused onlyOwner returns (uint256) {
-        _safeMint(to, _nextTokenId);
+    /**
+     * @notice Mint a new Liquidity NFT.
+     * @dev Only callable by the owner. Pausable for emergencies.
+     * @param to Recipient address of the NFT
+     * @param tokenAddress The ERC20 token address for the liquidity
+     * @param amount The liquidity amount stored in the NFT
+     * @return The minted NFT's tokenId
+     */
+    function mint(
+        address to,
+        address tokenAddress,
+        uint256 amount
+    )
+        external
+        whenNotPaused
+        onlyOwner
+        nonReentrant
+        returns (uint256)
+    {
+        uint256 currentTokenId = _nextTokenId;
         _nextTokenId++;
 
-        // Store the liquidity info with the minted NFT
-        nftInfo[_nextTokenId] = LiquidityNFTInfo({
+        _safeMint(to, currentTokenId);
+
+        nftInfo[currentTokenId] = LiquidityNFTInfo({
             tokenAddress: tokenAddress,
             amount: amount,
-            createdTimestamp: block.timestamp, // Set creation timestamp
-            lastUpdatedTimestamp: block.timestamp // Set last updated timestamp
+            createdTimestamp: block.timestamp,
+            lastUpdatedTimestamp: block.timestamp
         });
 
-        return _nextTokenId;
+        return currentTokenId;
     }
 
-    // Update NFT info, including the timestamps
-    function updateNFTInfo(uint256 tokenId, uint256 amount) external {
-        // Ensure that the sender is the owner of the NFT
-        require(ownerOf(tokenId) == msg.sender, "You are not the owner of this NFT");
-        // Update the NFT info with the new data
+    /**
+     * @notice Update the metadata (amount) of an existing NFT.
+     * @dev Only the NFT owner can update. Also updates the lastUpdatedTimestamp.
+     * @param tokenId The NFT ID to update
+     * @param amount New amount of liquidity to store
+     */
+    function updateNFTInfo(uint256 tokenId, uint256 amount) external nonReentrant {
+        require(ownerOf(tokenId) == msg.sender, "Not the NFT owner");
         LiquidityNFTInfo storage info = nftInfo[tokenId];
         info.amount = amount;
-        info.lastUpdatedTimestamp = block.timestamp; // Update last updated timestamp
-
+        info.lastUpdatedTimestamp = block.timestamp;
         emit MetadataUpdated(tokenId, amount);
     }
 
-    // Event for updating the NFT metadata
-    event MetadataUpdated(uint256 tokenId, uint256 amount);
-
-    // Function to get NFT info, including timestamps
+    /**
+     * @notice Returns the liquidity NFT metadata for a given tokenId.
+     * @param tokenId The NFT ID to query.
+     */
     function getNFTInfo(uint256 tokenId)
         external
         view
-        returns (address tokenAddress, uint256 amount, uint256 createdTimestamp, uint256 lastUpdatedTimestamp)
+        returns (
+            address tokenAddress,
+            uint256 amount,
+            uint256 createdTimestamp,
+            uint256 lastUpdatedTimestamp
+        )
     {
-        LiquidityNFTInfo memory info = nftInfo[tokenId];
-        return (info.tokenAddress, info.amount, info.createdTimestamp, info.lastUpdatedTimestamp);
-    }
-
-    // Function to pause the contract (onlyOwner)
-    function pause() external onlyOwner {
-        _pause(); // Internal function from Pausable contract
-    }
-
-    // Function to unpause the contract (onlyOwner)
-    function unpause() external onlyOwner {
-        _unpause(); // Internal function from Pausable contract
+        LiquidityNFTInfo storage info = nftInfo[tokenId];
+        return (
+            info.tokenAddress,
+            info.amount,
+            info.createdTimestamp,
+            info.lastUpdatedTimestamp
+        );
     }
 }
 
-contract ZebraSwap is Ownable, Pausable {
+/**
+ * @title ZebraSwap
+ * @notice The main swapping contract that holds ERC20 liquidity and uses a feeCollector to collect fees.
+ *         Integrates with ZebraLiquidityNFT to track liquidity positions as NFTs.
+ */
+contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    /// @notice Precision constant for percentage math
+    uint256 public constant FEE_DENOMINATOR = 1_000_000;
+
+    /// @notice Fee percentage (10,000 means 1% if / 1,000,000)
+    uint256 public FEE_PERCENTAGE = 10_000; // 1%
+
+    /// @dev Address authorized to collect fees
+    address public feeCollector;
+
+    /// @dev Liquidity NFT contract (manages minted NFTs)
+    ZebraLiquidityNFT public liquidityNFT;
+
+    /**
+     * @dev Stores data about a token allowed for swapping.
+     * @param tokenAddress The ERC20 address.
+     * @param isAllowed Whether swapping/liquidity is permitted for this token.
+     * @param price Price in USD-based units (owner-managed).
+     * @param decimals The token's own decimals.
+     */
     struct TokenInfo {
         address tokenAddress;
         bool isAllowed;
-        uint256 price; // in USD
-        uint8 decimals; // Token decimals
+        uint256 price; // in "USD" units (centralized)
+        uint8 decimals;
     }
 
+    /**
+     * @dev Tracks the liquidity added by a user for a specific token.
+     *      This mapping is only partially relevant if also using NFTs.
+     */
     struct LiquidityPosition {
         uint256 amount;
         uint256 timestamp;
     }
 
-    uint256 public FEE_PERCENTAGE = 1; // 1% swap fee
-
+    /// @dev symbol => TokenInfo
     mapping(string => TokenInfo) public allowedTokens;
+
+    /// @dev user => (tokenAddress => LiquidityPosition)
     mapping(address => mapping(address => LiquidityPosition)) public liquidityPositions;
 
-    ZebraLiquidityNFT public liquidityNFT;
-    address public feeCollector;
-
+    /**
+     * @dev Stores swap history info for frontends.
+     * @param historyId Auto-incrementing ID
+     * @param tokenA Input token symbol
+     * @param tokenB Output token symbol
+     * @param inputValue Amount of input
+     * @param outputValue Amount of output
+     * @param userAddress The user performing the swap
+     */
     struct History {
         uint256 historyId;
         string tokenA;
@@ -108,331 +183,448 @@ contract ZebraSwap is Ownable, Pausable {
         address userAddress;
     }
 
-    uint256 public _historyIndex;
+    /// @dev Internal index for swap history
+    uint256 private _historyIndex;
 
-    mapping(uint256 => History) private historys;
+    /// @dev Mapping of historyId => History
+    mapping(uint256 => History) private _histories;
 
-    mapping(uint256 => address) private _nftowners;
-
+    /// ------------------ EVENTS ------------------ ///
     event TokenAllowed(string symbol, address tokenAddress, uint256 price, uint8 decimals);
-    event LiquidityAdded(address user, address token, uint256 amount);
-    event LiquidityRemoved(address user, address token, uint256 amount);
+    event TokenDisallowed(string symbol);
+    event LiquidityAdded(address indexed user, address indexed token, uint256 amount);
+    event LiquidityRemoved(address indexed user, address indexed token, uint256 amount);
     event Swapped(
-        address indexed user, address inputToken, address outputToken, uint256 inputAmount, uint256 outputAmount
+        address indexed user,
+        address indexed inputToken,
+        address indexed outputToken,
+        uint256 inputAmount,
+        uint256 outputAmount
     );
-    event FeesCollected(uint256 amount);
     event FeeCollectorChanged(address indexed oldFeeCollector, address indexed newFeeCollector);
     event ETHWithdrawn(address indexed owner, uint256 amount);
 
+    /**
+     * @dev Deploy with reference to the existing LiquidityNFT contract.
+     * @param liquidityNFTAddress The deployed ZebraLiquidityNFT address.
+     */
     constructor(address liquidityNFTAddress) Ownable(msg.sender) {
+        require(liquidityNFTAddress != address(0), "Invalid NFT address");
         liquidityNFT = ZebraLiquidityNFT(liquidityNFTAddress);
         feeCollector = msg.sender;
     }
 
-    // Function to change the fee collector (only owner can change)
+    /**
+     * @notice Set a new address for fee collection.
+     * @param newFeeCollector The address to receive swap fees.
+     */
     function setFeeCollector(address payable newFeeCollector) external onlyOwner {
-        require(newFeeCollector != address(0), "New fee collector address cannot be zero");
+        require(newFeeCollector != address(0), "Cannot set zero address");
         address oldFeeCollector = feeCollector;
         feeCollector = newFeeCollector;
         emit FeeCollectorChanged(oldFeeCollector, newFeeCollector);
     }
 
+    /**
+     * @notice Update the fee percentage used in swaps.
+     * @dev 1_000_000 in denominator => 10_000 means 1%.
+     * @param newFeePercentage The new fee fraction of FEE_DENOMINATOR.
+     */
     function setFeePercentage(uint256 newFeePercentage) external onlyOwner {
-        require(newFeePercentage <= 100, "Fee percentage cannot exceed 100");
+        require(newFeePercentage <= FEE_DENOMINATOR, "Fee percentage too high");
         FEE_PERCENTAGE = newFeePercentage;
     }
 
+    /**
+     * @notice Retrieve details about a token from its symbol.
+     * @param symbol The string symbol of the token (e.g., "USDT", "WAN").
+     */
     function getTokenInfo(string memory symbol)
         external
         view
         returns (address tokenAddress, uint256 price, bool isAllowed)
     {
-        TokenInfo memory token = allowedTokens[symbol];
+        TokenInfo storage token = allowedTokens[symbol];
         return (token.tokenAddress, token.price, token.isAllowed);
     }
 
-    // Function to get the balance of any token this contract holds
+    /**
+     * @notice Get this contract's current balance of a given token.
+     * @param tokenAddress The ERC20 address to check.
+     */
     function getTokenBalance(address tokenAddress) external view returns (uint256) {
         return IERC20(tokenAddress).balanceOf(address(this));
     }
 
-    function allowToken(string memory symbol, address tokenAddress, uint256 price, uint8 decimals) external onlyOwner {
+    /**
+     * @notice Allow a new token to be used for liquidity and swapping.
+     * @param symbol The symbol (mapping key).
+     * @param tokenAddress The ERC20 address.
+     * @param price A price in USD-based units.
+     * @param decimals The token's decimals.
+     */
+    function allowToken(
+        string memory symbol,
+        address tokenAddress,
+        uint256 price,
+        uint8 decimals
+    )
+        external
+        onlyOwner
+    {
         require(tokenAddress != address(0), "Invalid token address");
-        allowedTokens[symbol] =
-            TokenInfo({tokenAddress: tokenAddress, isAllowed: true, price: price, decimals: decimals});
+        require(price > 1e15, "Price too small");
+        require(!allowedTokens[symbol].isAllowed, "Token already allowed");
+
+        allowedTokens[symbol] = TokenInfo({
+            tokenAddress: tokenAddress,
+            isAllowed: true,
+            price: price,
+            decimals: decimals
+        });
 
         emit TokenAllowed(symbol, tokenAddress, price, decimals);
     }
 
-    function addLiquidity(string memory symbol, uint256 amount) external whenNotPaused {
+    /**
+     * @notice Disallow a previously allowed token.
+     * @param symbol The symbol to disallow.
+     */
+    function disallowToken(string memory symbol) external onlyOwner {
+        require(allowedTokens[symbol].isAllowed, "Token already disallowed");
+        allowedTokens[symbol].isAllowed = false;
+        emit TokenDisallowed(symbol);
+    }
+
+    /**
+     * @notice Add liquidity of a given allowed token.
+     * @param symbol The token's symbol (must be allowed).
+     * @param amount The unscaled amount of tokens to add (e.g., 100).
+     */
+    function addLiquidity(string memory symbol, uint256 amount)
+        external
+        whenNotPaused
+        nonReentrant
+    {
         TokenInfo memory token = allowedTokens[symbol];
         require(token.isAllowed, "Token not allowed");
 
         IERC20 tokenContract = IERC20(token.tokenAddress);
 
-        // Validate if the user is providing the correct amount relative to the token's decimals
-        uint256 amountWithDecimals;
-
-        // If the token has decimals (e.g., 18 decimals for most ERC20 tokens)
-        if (token.decimals == 18) {
-            // The amount is already in the correct scale, no need to multiply
-            amountWithDecimals = amount;
-        } else {
-            // Scale the amount according to the token's decimals
-            amountWithDecimals = amount * (10 ** token.decimals);
-        }
-
-        // Ensure that the amount is not too small to prevent rounding issues
+        // Scale the user's input by token decimals
+        uint256 amountWithDecimals = token.decimals == 18
+            ? amount
+            : amount * (10 ** token.decimals);
         require(amountWithDecimals > 0, "Amount must be greater than zero");
 
-        // Record the contract's balance before the transfer
+        // Track balance before & after to confirm exact transfer
         uint256 initialBalance = tokenContract.balanceOf(address(this));
-
-        // Transfer tokens from user considering decimals
-        // uint256 amountWithDecimals = amount * (10 ** token.decimals);
         tokenContract.safeTransferFrom(msg.sender, address(this), amountWithDecimals);
-
-        // Record the contract's balance after the transfer
         uint256 finalBalance = tokenContract.balanceOf(address(this));
-
-        // Calculate the actual amount received (after fee deduction)
         uint256 actualAmountReceived = finalBalance - initialBalance;
 
-        // Ensure that the transfer was successful and the contract received a positive amount
-        require(actualAmountReceived > 0, "Fee on transfer token: No tokens received after fee");
+        require(actualAmountReceived == amountWithDecimals, "Transfer amount mismatch");
 
-        // Update liquidity position
-
+        // Update user's liquidity mapping
         LiquidityPosition storage position = liquidityPositions[msg.sender][token.tokenAddress];
-        position.amount += amountWithDecimals;
+        position.amount += actualAmountReceived;
         position.timestamp = block.timestamp;
 
-        // Mint Liquidity NFT with token and actual received amount info
-        uint256 nftid = liquidityNFT.mint(msg.sender, token.tokenAddress, amountWithDecimals);
-        _nftowners[nftid] = msg.sender;
+        // Mint an NFT representing this liquidity
+        // The minted NFT tracks the entire amount; in a real system, you might
+        // want to create or update existing NFTs if you prefer one NFT per user+token.
+        liquidityNFT.mint(msg.sender, token.tokenAddress, actualAmountReceived);
 
-        emit LiquidityAdded(msg.sender, token.tokenAddress, amountWithDecimals);
+        emit LiquidityAdded(msg.sender, token.tokenAddress, actualAmountReceived);
     }
 
+    /**
+     * @notice Remove liquidity from the contract. Uses an NFT-based check for ownership.
+     * @param symbol The symbol of the token to remove.
+     * @param amount The amount (scaled) of tokens to remove.
+     * @param nftId The NFT ID that represents this liquidity position.
+     */
     function removeLiquidity(
         string memory symbol,
         uint256 amount,
-        uint256 nftId // Added NFT ID as input
-    ) external whenNotPaused {
+        uint256 nftId
+    )
+        external
+        whenNotPaused
+        nonReentrant
+    {
         TokenInfo memory token = allowedTokens[symbol];
         require(token.isAllowed, "Token not allowed");
-        require(_nftowners[nftId] == msg.sender, "You do not own this NFT");
 
+        // Check that the caller is indeed the owner of the relevant NFT
+        require(liquidityNFT.ownerOf(nftId) == msg.sender, "Not the NFT owner");
+
+        // Check in the liquidity mapping that user has enough tokens
         LiquidityPosition storage position = liquidityPositions[msg.sender][token.tokenAddress];
         require(position.amount >= amount, "Insufficient liquidity");
 
-        IERC20 tokenContract = IERC20(token.tokenAddress);
-
-        // Record the contract's balance before the transfer
-        uint256 initialBalance = tokenContract.balanceOf(address(this));
-
-        // Update liquidity position
+        // Update internal accounting
         position.amount -= amount;
 
-        // Transfer tokens back to the user
-        tokenContract.safeTransfer(msg.sender, amount);
+        // Optional: we also check the NFT's stored amount, then update it
+        (
+            ,
+            uint256 nftAmount,
+            ,
+        ) = liquidityNFT.getNFTInfo(nftId);
 
-        // Find the user's liquidity NFT (NFT ID provided by user)
-
-        // Record the contract's balance after the transfer
-        uint256 finalBalance = tokenContract.balanceOf(address(this));
-
-        // Calculate the actual amount transferred to the user (after fee deduction)
-        uint256 actualAmountTransferred = initialBalance - finalBalance;
-
-        // Ensure that the transfer was successful and the contract sent a positive amount
-        require(actualAmountTransferred > 0, "Fee on transfer token: No tokens sent after fee");
-
-        // Get current NFT information from ZebraLiquidityNFT
-        (, uint256 nftAmount,,) = liquidityNFT.getNFTInfo(nftId); // Get the current amount from the NFT
-
-        // Update the NFT info with the new liquidity amount and timestamp only if the amount has changed
         if (position.amount != nftAmount) {
+            // Update the NFT's metadata to reflect the new total
             liquidityNFT.updateNFTInfo(nftId, position.amount);
         }
+
+        // Transfer the tokens out
+        IERC20 tokenContract = IERC20(token.tokenAddress);
+        uint256 initialBalance = tokenContract.balanceOf(address(this));
+        tokenContract.safeTransfer(msg.sender, amount);
+        uint256 finalBalance = tokenContract.balanceOf(address(this));
+
+        uint256 actualAmountTransferred = initialBalance - finalBalance;
+        require(actualAmountTransferred > 0, "No tokens transferred; fee on transfer?");
 
         emit LiquidityRemoved(msg.sender, token.tokenAddress, amount);
     }
 
-    function _transactionHistory(
-        string memory tokenName,
-        string memory etherToken,
+    /**
+     * @dev Internal function to record transaction history for swaps.
+     */
+    function _recordTransactionHistory(
+        string memory tokenA,
+        string memory tokenB,
         uint256 inputValue,
         uint256 outputValue
     ) internal {
         _historyIndex++;
-        uint256 _historyId = _historyIndex;
-        History storage history = historys[_historyId];
-        history.historyId = _historyId;
-        history.userAddress = msg.sender;
-        history.tokenA = tokenName;
-        history.tokenB = etherToken;
-        history.inputValue = inputValue;
-        history.outputValue = outputValue;
+        uint256 historyId = _historyIndex;
+
+        History storage newHistory = _histories[historyId];
+        newHistory.historyId = historyId;
+        newHistory.userAddress = msg.sender;
+        newHistory.tokenA = tokenA;
+        newHistory.tokenB = tokenB;
+        newHistory.inputValue = inputValue;
+        newHistory.outputValue = outputValue;
     }
 
-    function WanToToken(string memory outputSymbol) external payable whenNotPaused {
-        uint256 inputAmount = msg.value; // Use msg.value to get the amount of WAN sent
+    /**
+     * @notice Swap WAN -> ERC20 token. (WAN is assumed to have symbol "WAN" in allowedTokens.)
+     * @param outputSymbol The symbol of the token to receive.
+     */
+    function WanToToken(string memory outputSymbol)
+        external
+        payable
+        whenNotPaused
+        nonReentrant
+    {
+        uint256 inputAmount = msg.value;
+        require(inputAmount > 0, "Input must be > 0");
 
         TokenInfo memory outputToken = allowedTokens[outputSymbol];
         require(outputToken.isAllowed, "Output token not allowed");
 
         TokenInfo memory inputToken = allowedTokens["WAN"];
-        // Get decimals for WAN (native token) and the output token
-        uint8 inputDecimals = 18; // WAN (native token) generally has 18 decimals
-        uint8 outputDecimals = outputToken.decimals; // Output token decimals
+        require(inputToken.isAllowed, "WAN token must be registered");
 
-        // Calculate the fee and the amount to swap
-
-        uint256 feeAmount = (inputAmount * FEE_PERCENTAGE * (10 ** inputDecimals)) / (100 * (10 ** inputDecimals));
-
+        // Calculate fee and swap amount
+        uint256 feeAmount = (inputAmount * FEE_PERCENTAGE) / FEE_DENOMINATOR;
+        require(feeAmount < inputAmount, "Fee exceeds input");
         uint256 swapAmount = inputAmount - feeAmount;
 
-        // Transfer the fee to the fee collector (in native tokens)
-        payable(feeCollector).transfer(feeAmount);
+        // Transfer fee to feeCollector
+        (bool feeSent, ) = payable(feeCollector).call{value: feeAmount}("");
+        require(feeSent, "Fee transfer failed");
 
-        // Calculate the output amount based on the price and adjust for decimals
-        uint256 outputAmount =
-            (swapAmount * outputToken.price * (10 ** outputDecimals)) / (inputToken.price * (10 ** inputDecimals));
+        // Scale prices to 18 decimals
+        uint8 inputDecimals = 18; // native WAN
+        uint8 outputDecimals = outputToken.decimals;
 
-        // Ensure there's sufficient liquidity of the output token
-        require(IERC20(outputToken.tokenAddress).balanceOf(address(this)) >= outputAmount, "Insufficient liquidity");
+        uint256 normalizedInputPrice = inputToken.price * (10 ** (18 - inputDecimals));
+        uint256 normalizedOutputPrice = outputToken.price * (10 ** (18 - outputDecimals));
 
-        // Transfer the output tokens to the user
+        // Calculate output tokens
+        uint256 outputAmount = (swapAmount * normalizedInputPrice) / normalizedOutputPrice;
+        require(outputAmount > 0, "Output = 0");
+
+        // Ensure contract has enough tokens
+        uint256 tokenBalance = IERC20(outputToken.tokenAddress).balanceOf(address(this));
+        require(tokenBalance >= outputAmount, "Insufficient liquidity");
+
+        // Transfer to user
         IERC20(outputToken.tokenAddress).safeTransfer(msg.sender, outputAmount);
 
-        _transactionHistory("WAN", outputSymbol, inputAmount, outputAmount);
-
-        // Emit the swap event
+        // Record history & emit event
+        _recordTransactionHistory("WAN", outputSymbol, inputAmount, outputAmount);
         emit Swapped(msg.sender, address(0), outputToken.tokenAddress, inputAmount, outputAmount);
     }
 
-    function TokenToWan(string memory inputSymbol, uint256 inputAmount) external whenNotPaused {
+    /**
+     * @notice Swap an ERC20 token to WAN.
+     * @param inputSymbol The symbol of the token being sold.
+     * @param inputAmount The unscaled amount of tokens to swap.
+     */
+    function TokenToWan(string memory inputSymbol, uint256 inputAmount)
+        external
+        whenNotPaused
+        nonReentrant
+    {
         TokenInfo memory inputToken = allowedTokens[inputSymbol];
         require(inputToken.isAllowed, "Input token not allowed");
-        // Get decimals for input token
+
+        // Scale input by decimals
         uint8 inputDecimals = inputToken.decimals;
+        uint256 scaledInputAmount = inputAmount * (10 ** inputDecimals);
 
-        uint8 outputDecimals = 18;
-        uint256 scaledInputAmount = inputAmount * (10 ** inputDecimals); // Correctly scale the input amount based on the input token's decimals
+        // Calculate fee
+        uint256 scaledFeeAmount = (scaledInputAmount * FEE_PERCENTAGE) / FEE_DENOMINATOR;
+        uint256 swapAmount = scaledInputAmount - scaledFeeAmount;
+        require(swapAmount > 0, "Swap amount too small");
 
-        uint256 feeAmount = (scaledInputAmount * FEE_PERCENTAGE) / 100;
-        uint256 swapAmount = scaledInputAmount - feeAmount;
-
-        // Transfer the input tokens from the user to the contract
+        // Transfer input from user
         IERC20(inputToken.tokenAddress).safeTransferFrom(msg.sender, address(this), scaledInputAmount);
 
-        // Transfer the fee to the fee collector
-        uint256 feeAmountScaled = feeAmount / (10 ** inputDecimals); // scale the fee back
+        // Transfer fee portion to feeCollector
+        IERC20(inputToken.tokenAddress).safeTransfer(feeCollector, scaledFeeAmount);
 
-        IERC20(inputToken.tokenAddress).safeTransfer(feeCollector, feeAmountScaled);
+        // Calculate how many WAN to send
+        // We assume WAN has 18 decimals
+        uint8 outputDecimals = 18;
+        uint256 outputAmount = (swapAmount * inputToken.price * (10 ** outputDecimals))
+            / (10 ** inputDecimals);
 
-        // Calculate the output amount in WAN (adjusted for decimals and price)
-        uint256 outputAmount = (swapAmount * inputToken.price * (10 ** outputDecimals)) / (10 ** inputDecimals); // Correct the calculation to include decimals
+        require(address(this).balance >= outputAmount, "Insufficient WAN liquidity");
 
-        // Ensure there's enough balance of WAN to complete the swap
-        require(address(this).balance >= outputAmount, "Insufficient liquidity");
+        // Transfer WAN out
+        (bool sent, ) = payable(msg.sender).call{value: outputAmount}("");
+        require(sent, "WAN transfer failed");
 
-        // Transfer the output amount (WAN) to the user
-        payable(msg.sender).transfer(outputAmount);
-
-        _transactionHistory(inputSymbol, "WAN", inputAmount, outputAmount);
-
-        // Emit the swap event
+        _recordTransactionHistory(inputSymbol, "WAN", inputAmount, outputAmount);
         emit Swapped(msg.sender, inputToken.tokenAddress, address(0), inputAmount, outputAmount);
     }
 
-    function TokenToToken(string memory inputSymbol, string memory outputSymbol, uint256 inputAmount)
+    /**
+     * @notice Swap one ERC20 token into another ERC20 token.
+     * @param inputSymbol The symbol of the token being sold.
+     * @param outputSymbol The symbol of the token to buy.
+     * @param inputAmount The unscaled amount of the input token.
+     */
+    function TokenToToken(
+        string memory inputSymbol,
+        string memory outputSymbol,
+        uint256 inputAmount
+    )
         external
         whenNotPaused
+        nonReentrant
     {
         TokenInfo memory inputToken = allowedTokens[inputSymbol];
         TokenInfo memory outputToken = allowedTokens[outputSymbol];
-
         require(inputToken.isAllowed, "Input token not allowed");
         require(outputToken.isAllowed, "Output token not allowed");
 
-        // Get decimals for input and output tokens
+        // Scale input by decimals
         uint8 inputDecimals = inputToken.decimals;
         uint8 outputDecimals = outputToken.decimals;
-        // Ensure inputAmount is in the correct scale
-        uint256 scaledInputAmount = inputAmount * (10 ** inputDecimals); // Scale input based on the token's decimals
+        uint256 scaledInputAmount = inputAmount * (10 ** inputDecimals);
 
-        // Calculate the fee and swap amount
-        uint256 feeAmount = (scaledInputAmount * FEE_PERCENTAGE) / 100;
-        uint256 swapAmount = scaledInputAmount - feeAmount;
+        // Fee
+        uint256 scaledFeeAmount = (scaledInputAmount * FEE_PERCENTAGE) / FEE_DENOMINATOR;
+        uint256 swapAmount = scaledInputAmount - scaledFeeAmount;
+        require(swapAmount > 0, "Swap amount too small");
 
-        // Transfer the input tokens from the user to the contract
+        // Transfer from user
         IERC20(inputToken.tokenAddress).safeTransferFrom(msg.sender, address(this), scaledInputAmount);
 
-        // Transfer the fee to the fee collector
-        uint256 feeAmountScaled = feeAmount / (10 ** inputDecimals); // scale the fee back to the original amount
+        // Transfer fee
+        IERC20(inputToken.tokenAddress).safeTransfer(feeCollector, scaledFeeAmount);
 
-        IERC20(inputToken.tokenAddress).safeTransfer(feeCollector, feeAmountScaled);
+        // Price-based output calculation
+        uint256 outputAmount = (swapAmount * inputToken.price * (10 ** outputDecimals))
+            / (outputToken.price * (10 ** inputDecimals));
 
-        // Calculate the output amount considering token prices and decimals
-        uint256 outputAmount =
-            (swapAmount * inputToken.price * (10 ** outputDecimals)) / (outputToken.price * (10 ** inputDecimals));
+        require(
+            IERC20(outputToken.tokenAddress).balanceOf(address(this)) >= outputAmount,
+            "Insufficient liquidity"
+        );
 
-        // Ensure there's sufficient liquidity of the output token
-        require(IERC20(outputToken.tokenAddress).balanceOf(address(this)) >= outputAmount, "Insufficient liquidity");
-
-        // Transfer the output tokens to the user
+        // Transfer out
         IERC20(outputToken.tokenAddress).safeTransfer(msg.sender, outputAmount);
 
-        _transactionHistory(inputSymbol, outputSymbol, inputAmount, outputAmount);
-        // Emit the swap event
-
+        _recordTransactionHistory(inputSymbol, outputSymbol, inputAmount, outputAmount);
         emit Swapped(msg.sender, inputToken.tokenAddress, outputToken.tokenAddress, inputAmount, outputAmount);
     }
 
+    /**
+     * @notice Change the price of a given token. Centralized function for demonstration.
+     * @param symbol The token symbol to change.
+     * @param newPrice The new price in the same "USD" scale used initially.
+     */
     function changeTokenPrice(string memory symbol, uint256 newPrice) external onlyOwner {
         TokenInfo storage token = allowedTokens[symbol];
         require(token.isAllowed, "Token is not allowed");
-
-        // Update the token price only if the token exists and is allowed
         token.price = newPrice;
     }
 
-    function getAllHistory() public view returns (History[] memory) {
+    /**
+     * @notice Get the entire swap history in an array of History structs.
+     * @return An array of History entries.
+     */
+    function getAllHistory() external view returns (History[] memory) {
         uint256 itemCount = _historyIndex;
-        uint256 currentIndex = 0;
-
         History[] memory items = new History[](itemCount);
-        for (uint256 i = 1; i < itemCount; i++) {
-            uint256 currentId = i + 1;
-            History storage currentItem = historys[currentId];
-            items[currentIndex] = currentItem;
-            currentIndex += 1;
+        for (uint256 i = 1; i <= itemCount; i++) {
+            items[i - 1] = _histories[i];
         }
         return items;
     }
 
-    // Function to pause the contract (onlyOwner)
+    /**
+     * @notice Retrieve a single history entry by ID.
+     * @param historyId The ID to retrieve (1-based).
+     */
+    function getHistory(uint256 historyId) external view returns (History memory) {
+        require(historyId > 0 && historyId <= _historyIndex, "Invalid history ID");
+        return _histories[historyId];
+    }
+
+    /**
+     * @notice Pause the contract (onlyOwner).
+     */
     function pause() external onlyOwner {
-        _pause(); // Internal function from Pausable contract
+        _pause();
     }
 
-    // Function to unpause the contract (onlyOwner)
+    /**
+     * @notice Unpause the contract (onlyOwner).
+     */
     function unpause() external onlyOwner {
-        _unpause(); // Internal function from Pausable contract
+        _unpause();
     }
 
+    /**
+     * @notice Receive WAN/ETH directly. Typically from TokenToWan redemption.
+     */
     receive() external payable {}
 
-    //Functon to Withdraw ETH from Contract
+    /**
+     * @notice Fallback to revert any unknown calls.
+     */
+    fallback() external payable {
+        revert("Fallback not allowed");
+    }
+
+    /**
+     * @notice Withdraw WAN/ETH from contract to owner.
+     * @param amount The amount of ETH to withdraw.
+     */
     function withdraw(uint256 amount) external onlyOwner {
         require(amount <= address(this).balance, "Insufficient balance");
-
-        // Transfer the specified amount of ETH to the owner
-        payable(owner()).transfer(amount);
-
-        // Emit an event for transparency
+        (bool sent, ) = payable(owner()).call{value: amount}("");
+        require(sent, "Withdraw transfer failed");
         emit ETHWithdrawn(owner(), amount);
     }
 }
