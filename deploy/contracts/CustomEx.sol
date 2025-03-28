@@ -2,67 +2,155 @@
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-contract CustomToken is ERC20, Ownable {
-    uint256 public constant MAX_SUPPLY = 1000000 * 10 ** 18; // Maximum supply of 1M tokens
+/**
+ * @title CustomToken
+ * @notice A simple ERC20 token. The DEX enforces a global supply limit.
+ *         If using standard OpenZeppelin Ownable, remove (msg.sender) from inheritance.
+ */
+// If using standard Ownable, do `contract CustomToken is ERC20, Ownable`
+contract CustomToken is ERC20, Ownable(msg.sender) {
+    /**
+     * @dev Constructor sets name & symbol, then optionally mints an initial supply
+     *      to the `initialOwner` address. The DEX or other contract enforces the global cap.
+     */
+    constructor(
+        string memory name,
+        string memory symbol,
+        address initialOwner,
+        uint256 initialSupply
+    ) ERC20(name, symbol) {
+        // Transfer ownership to the specified address (the DEX, if that's your intention)
+        _transferOwnership(initialOwner);
 
-    constructor(string memory name, string memory symbol) ERC20(name, symbol) Ownable(msg.sender) {
-        // Only mint the initial supply once, and only to the owner
-        _mint(msg.sender, 1000000 * 10 ** 18);
+        // Mint initial supply if specified
+        if (initialSupply > 0) {
+            _mint(initialOwner, initialSupply);
+        }
     }
 
-    // Function to mint additional tokens (only callable by the owner)
+    /**
+     * @dev Mints tokens to `to`. Only the owner can call this. No internal max supply check.
+     *      The DEX ensures we never exceed the global cap.
+     */
     function mint(address to, uint256 amount) external onlyOwner {
-        require(totalSupply() + amount <= MAX_SUPPLY, "ERC20: minting exceeds max supply");
         _mint(to, amount);
     }
 }
 
-contract CustomDex is ReentrancyGuard {
+/**
+ * @title CustomDex
+ * @notice A minimal DEX that enforces a single global max supply across all CustomTokens,
+ *         uses SafeERC20 for token transfers, applies a 0.3% fee for token-to-token swaps,
+ *         and offers naive ETH <-> token conversion for demonstration only.
+ */
+// If using standard OpenZeppelin Ownable, do `contract CustomDex is ReentrancyGuard, Ownable`
+contract CustomDex is ReentrancyGuard, Ownable(msg.sender) {
     using SafeERC20 for IERC20;
 
-    // Custom tokens to be initialized
-    string[] public tokens = ["tUSD", "BNB", "USDC", "TRON", "MATIC"];
+    // -----------------------------
+    //       Global Supply Cap
+    // -----------------------------
+    uint256 public constant GLOBAL_MAX_SUPPLY = 1_000_000 * 10**18;
+    uint256 public mintedSoFar;
 
-    //map to mantain the tokens and its instance
+    // -----------------------------
+    //       Token Registry
+    // -----------------------------
+    mapping(string => CustomToken) public tokenInstanceMap;
+    string[] public tokenList; // Keep track of token "keys" for iteration if needed
 
-    mapping(string => ERC20) public tokenInstanceMap;
+    // -----------------------------
+    //   Simplified ETH Conversion
+    // -----------------------------
+    /**
+     * @dev For demonstration: 1 ETH = 1 * 10^18 tokens. This is not a real market rate!
+     *      In production, use a pricing oracle or an AMM approach for ETH <-> token conversions.
+     */
+    uint256 public constant ETH_BASE_RATE = 1 ether; 
 
-    uint256 ethValue = 1 ether;
+    // Fee for token-to-token swaps (0.3%)
+    uint256 public swapFeeBps = 30; // 30 basis points = 0.3%
 
-    struct History {
-        uint256 historyId;
-        string tokenA;
-        string tokenB;
-        uint256 inputValue;
-        uint256 outputValue;
-        address userAddress;
+    // -----------------------------
+    //         Swap Events
+    // -----------------------------
+    event Swapped(
+        address indexed user,
+        string indexed tokenA,
+        string indexed tokenB,
+        uint256 inputAmount,
+        uint256 outputAmount
+    );
+
+    /**
+     * @dev Deploys some initial tokens (e.g., "tUSD", "BNB", etc.).
+     *      Each with 100k supply minted to the DEX. This usage is optional.
+     */
+    constructor() {
+        _addToken("tUSD", "tUSD", 100_000 * 10**18);
+        _addToken("BNB", "BNB", 100_000 * 10**18);
+        _addToken("USDC", "USDC", 100_000 * 10**18);
+        _addToken("TRON", "TRON", 100_000 * 10**18);
+        _addToken("MATIC", "MATIC", 100_000 * 10**18);
     }
 
-    uint256 public _historyIndex;
+    /**
+     * @dev Owner can deploy a new CustomToken with `initialSupply`. 
+     *      This counts against the global 1M supply. 
+     *      The DEX becomes the token's owner.
+     */
+    function addToken(string memory name, string memory symbol, uint256 initialSupply)
+        external
+        onlyOwner
+    {
+        _addToken(name, symbol, initialSupply);
+    }
 
-    mapping(uint256 => History) private historys;
+    /**
+     * @dev Internal helper that checks global limits and deploys a new token contract.
+     */
+    function _addToken(string memory name, string memory symbol, uint256 initialSupply)
+        internal
+    {
+        require(bytes(name).length > 0, "Invalid token name");
+        require(address(tokenInstanceMap[name]) == address(0), "Token already exists");
 
-    constructor() {
-        for (uint256 i = 0; i < tokens.length; i++) {
-            CustomToken token = new CustomToken(tokens[i], tokens[i]);
-            tokenInstanceMap[tokens[i]] = token;
+        // Enforce global max supply across all tokens
+        require(mintedSoFar + initialSupply <= GLOBAL_MAX_SUPPLY, "Exceeds global supply");
+        mintedSoFar += initialSupply;
+
+        // Deploy new token. Dex is the owner (i.e., address(this)).
+        CustomToken token = new CustomToken(name, symbol, address(this), 0);
+        tokenInstanceMap[name] = token;
+        tokenList.push(name);
+
+        // If initialSupply > 0, mint to Dex
+        if (initialSupply > 0) {
+            token.mint(address(this), initialSupply);
         }
     }
 
-    function getBalance(string memory tokenName, address _address) public view returns (uint256) {
-        return tokenInstanceMap[tokenName].balanceOf(_address);
+    /**
+     * @dev Mint additional supply for an existing token, subject to the global cap.
+     */
+    function mintToken(string memory tokenName, uint256 amount) external onlyOwner {
+        require(address(tokenInstanceMap[tokenName]) != address(0), "Token does not exist");
+        require(mintedSoFar + amount <= GLOBAL_MAX_SUPPLY, "Exceeds global supply");
+        mintedSoFar += amount;
+
+        // Mint to the DEX (or potentially to the owner if desired)
+        tokenInstanceMap[tokenName].mint(address(this), amount);
     }
 
-    function getTotalSupply(string memory tokenName) public view returns (uint256) {
-        return tokenInstanceMap[tokenName].totalSupply();
-    }
-
-    function getName(string memory tokenName) public view returns (string memory) {
-        return tokenInstanceMap[tokenName].name();
+    // ----------------------------------------
+    //        GETTERS & VIEW FUNCTIONS
+    // ----------------------------------------
+    function getBalance(string memory tokenName, address user) public view returns (uint256) {
+        return tokenInstanceMap[tokenName].balanceOf(user);
     }
 
     function getTokenAddress(string memory tokenName) public view returns (address) {
@@ -73,157 +161,141 @@ contract CustomDex is ReentrancyGuard {
         return address(this).balance;
     }
 
-    function _transactionHistory(
-        string memory tokenName,
-        string memory etherToken,
-        uint256 inputValue,
-        uint256 outputValue
-    ) internal {
-        _historyIndex++;
-        uint256 _historyId = _historyIndex;
-        History storage history = historys[_historyId];
-        history.historyId = _historyId;
-        history.userAddress = msg.sender;
-        history.tokenA = tokenName;
-        history.tokenB = etherToken;
-        history.inputValue = inputValue;
-        history.outputValue = outputValue;
-    }
+    // ----------------------------------------
+    //        ETH <--> TOKEN SWAPS
+    // ----------------------------------------
 
-    // native to any token
-    function swapEthToToken(string memory tokenName, uint256 minOutputValue) public payable returns (uint256) {
-        // Token existence check
+    /**
+     * @dev Swap native ETH to a given token at a fixed demonstration rate:
+     *      1 ETH => 1 * 10^18 tokens, scaled by msg.value.
+     *      Slippage check ensures the user won't receive fewer tokens than expected.
+     */
+    function swapEthToToken(string memory tokenName, uint256 minOutputValue)
+        public
+        payable
+        nonReentrant
+        returns (uint256)
+    {
+        require(msg.value > 0, "No ETH sent");
         require(address(tokenInstanceMap[tokenName]) != address(0), "Token does not exist");
 
-        uint256 inputValue = msg.value;
-        uint256 outputValue = (inputValue / ethValue) * 10 ** 18;
+        // For example: if msg.value = 0.5 ETH => outputValue = 0.5 * 10^18 tokens
+        uint256 outputValue = (msg.value * 10**18) / ETH_BASE_RATE;
 
-        // Slippage protection: Ensure output is at least minOutputValue
-        require(outputValue >= minOutputValue, "Slippage too high, output less than min");
+        require(outputValue >= minOutputValue, "Slippage too high");
 
-        // Check if the contract has enough tokens to fulfill the swap
-        uint256 tokenBalance = tokenInstanceMap[tokenName].balanceOf(address(this));
-        require(tokenBalance >= outputValue, "Insufficient balance in contract to complete swap");
+        // Ensure DEX has enough tokens in its balance
+        IERC20 token = IERC20(tokenInstanceMap[tokenName]);
+        require(token.balanceOf(address(this)) >= outputValue, "Insufficient DEX token balance");
 
-        // require(
-        //     tokenInstanceMap[tokenName].transfer(msg.sender, outputValue),
-        //     "Transfer failed"
-        // );
-        // Safe transfer to the user
-        IERC20 token = IERC20(address(tokenInstanceMap[tokenName]));
+        // Transfer tokens to msg.sender
         token.safeTransfer(msg.sender, outputValue);
 
-        string memory etherToken = "Ether";
-        _transactionHistory(tokenName, etherToken, inputValue, outputValue);
+        // Emit an event for off-chain indexing
+        emit Swapped(msg.sender, "ETH", tokenName, msg.value, outputValue);
+
         return outputValue;
     }
 
-    function swapTokenToEth(string memory tokenName, uint256 _amount, uint256 minOutputValue)
+    /**
+     * @dev Swap tokens for ETH at the same fixed rate. 
+     *      Slippage check ensures user won't receive less ETH than minOutputValue.
+     */
+    function swapTokenToEth(string memory tokenName, uint256 amount, uint256 minOutputValue)
         public
         nonReentrant
         returns (uint256)
     {
-        // Token existence check
         require(address(tokenInstanceMap[tokenName]) != address(0), "Token does not exist");
+        require(amount > 0, "Invalid amount");
 
-        // Ensure correct precision by keeping full decimals
-        uint256 exactAmount = _amount;
-        uint256 ethToBeTransfered = (exactAmount * ethValue) / 10 ** 18;
+        // For example: if amount = 1 * 10^18 tokens => ethToTransfer = 1 ETH
+        uint256 ethToTransfer = (amount * ETH_BASE_RATE) / (10**18);
 
-        // Slippage protection: Ensure output is at least minOutputValue
-        require(ethToBeTransfered >= minOutputValue, "Slippage too high, output less than min");
+        require(ethToTransfer >= minOutputValue, "Slippage too high");
+        require(address(this).balance >= ethToTransfer, "Insufficient DEX ETH balance");
 
-        require(address(this).balance >= ethToBeTransfered, "Dex is running low on balance");
+        // Transfer tokens in
+        IERC20(tokenInstanceMap[tokenName]).safeTransferFrom(msg.sender, address(this), amount);
 
-        // Check the approval for transferFrom
-        IERC20 token = IERC20(address(tokenInstanceMap[tokenName]));
-        uint256 allowance = token.allowance(msg.sender, address(this));
-        require(allowance >= _amount, "Allowance is not enough for the transfer");
+        // Transfer ETH out
+        (bool success, ) = payable(msg.sender).call{value: ethToTransfer}("");
+        require(success, "ETH transfer failed");
 
-        // Update contract state before external interaction (checks-effects-interactions)
+        emit Swapped(msg.sender, tokenName, "ETH", amount, ethToTransfer);
 
-        // require(
-        //     tokenInstanceMap[tokenName].transferFrom(
-        //         msg.sender,
-        //         address(this),
-        //         _amount
-        //     ),
-        //     "Transfer failed"
-        // );
-
-        // // Now, interact with the external address (transfer Ether to the user)
-        // payable(msg.sender).transfer(ethToBeTransfered);
-        // Update contract state before external interaction (checks-effects-interactions)
-        token.safeTransferFrom(msg.sender, address(this), _amount);
-
-        // Now, transfer Ether to the user
-        payable(msg.sender).transfer(ethToBeTransfered);
-
-        string memory etherToken = "Ether";
-
-        _transactionHistory(tokenName, etherToken, exactAmount, ethToBeTransfered);
-        return ethToBeTransfered;
+        return ethToTransfer;
     }
 
-    //We'll calculate the output value based on the ratio of the source and destination token balances in the contract,
-    //ensuring that the value exchanged respects the current liquidity and preventing arbitrage.
+    // ----------------------------------------
+    //        TOKEN <--> TOKEN SWAPS
+    // ----------------------------------------
 
+    /**
+     * @dev Swap one token to another using a Uniswap-style constant product formula 
+     *      plus a 0.3% fee. This is still a simplified version. 
+     */
     function swapTokenToToken(
         string memory srcTokenName,
         string memory destTokenName,
-        uint256 _amount,
+        uint256 amountIn,
         uint256 minOutputValue
-    ) public nonReentrant {
-        // Token existence checks
-        require(address(tokenInstanceMap[srcTokenName]) != address(0), "Source token does not exist");
-        require(address(tokenInstanceMap[destTokenName]) != address(0), "Destination token does not exist");
+    )
+        public
+        nonReentrant
+        returns (uint256 outputValue)
+    {
+        require(address(tokenInstanceMap[srcTokenName]) != address(0), "Src token does not exist");
+        require(address(tokenInstanceMap[destTokenName]) != address(0), "Dest token does not exist");
+        require(amountIn > 0, "Invalid amount");
+        require(
+            keccak256(bytes(srcTokenName)) != keccak256(bytes(destTokenName)),
+            "Cannot swap same token"
+        );
 
-        // Transfer the source token from the user to the contract
+        IERC20 srcToken = IERC20(tokenInstanceMap[srcTokenName]);
+        IERC20 destToken = IERC20(tokenInstanceMap[destTokenName]);
 
-        // require(
-        //     tokenInstanceMap[srcTokenName].transferFrom(
-        //         msg.sender,
-        //         address(this),
-        //         _amount
-        //     ),
-        //     "Transfer failed"
-        // );
-        // Transfer the source token from the user to the contract
-        IERC20 srcToken = IERC20(address(tokenInstanceMap[srcTokenName]));
-        srcToken.safeTransferFrom(msg.sender, address(this), _amount);
+        // Gather current DEX liquidity
+        uint256 srcBalance = srcToken.balanceOf(address(this));
+        uint256 destBalance = destToken.balanceOf(address(this));
+        require(srcBalance > 0 && destBalance > 0, "No liquidity available");
 
-        // Get the contract's current balances of source and destination tokens
-        uint256 srcTokenBalance = tokenInstanceMap[srcTokenName].balanceOf(address(this));
-        uint256 destTokenBalance = tokenInstanceMap[destTokenName].balanceOf(address(this));
+        // Apply 0.3% fee
+        uint256 amountInAfterFee = (amountIn * (1000 - swapFeeBps)) / 1000;
 
-        // Calculate the output value based on the current ratio of the token balances
-        uint256 outputValue = (_amount * destTokenBalance) / srcTokenBalance;
+        // Uniswap-style formula: output = (destBalance * amountInAfterFee) / (srcBalance + amountInAfterFee)
+        outputValue = (destBalance * amountInAfterFee) / (srcBalance + amountInAfterFee);
 
-        // Slippage protection: Ensure output is at least minOutputValue
-        require(outputValue >= minOutputValue, "Slippage too high, output less than min");
+        require(outputValue >= minOutputValue, "Slippage too high");
+        require(outputValue <= destBalance, "Insufficient DEX token balance");
 
-        // require(
-        //     tokenInstanceMap[destTokenName].transfer(msg.sender, outputValue),
-        //     "Transfer failed"
-        // );
-        // Transfer the destination token to the user
-        IERC20 destToken = IERC20(address(tokenInstanceMap[destTokenName]));
+        // Transfer srcTokens in
+        srcToken.safeTransferFrom(msg.sender, address(this), amountIn);
+
+        // Transfer destTokens out
         destToken.safeTransfer(msg.sender, outputValue);
 
-        _transactionHistory(srcTokenName, destTokenName, _amount, outputValue);
+        emit Swapped(msg.sender, srcTokenName, destTokenName, amountIn, outputValue);
+
+        return outputValue;
     }
 
-    function getAllHistory() public view returns (History[] memory) {
-        uint256 itemCount = _historyIndex;
-        uint256 currentIndex = 0;
+    // ----------------------------------------
+    //       Owner / Admin Utilities
+    // ----------------------------------------
 
-        History[] memory items = new History[](itemCount);
-        for (uint256 i = 0; i < itemCount; i++) {
-            uint256 currentId = i + 1;
-            History storage currentItem = historys[currentId];
-            items[currentIndex] = currentItem;
-            currentIndex += 1;
-        }
-        return items;
+    /**
+     * @dev Allows the owner to withdraw ETH from the contract, e.g. to collect fees.
+     */
+    function withdrawETH(uint256 amount) external onlyOwner {
+        require(address(this).balance >= amount, "Not enough ETH in contract");
+        (bool success, ) = owner().call{value: amount}("");
+        require(success, "Withdraw failed");
     }
+
+    /**
+     * @dev Fallback to receive ETH sent directly to the contract address.
+     */
+    receive() external payable {}
 }
