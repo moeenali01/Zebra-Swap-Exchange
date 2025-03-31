@@ -7,6 +7,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+
 
 /**
  * @title ZebraLiquidityNFT
@@ -35,6 +37,8 @@ contract ZebraLiquidityNFT is ERC721, Pausable, Ownable(msg.sender), ReentrancyG
 
     /// @dev Mapping of NFT ID to its Liquidity Info
     mapping(uint256 => LiquidityNFTInfo) public nftInfo;
+    
+
 
     /// @dev Emitted when NFT metadata is updated
     event MetadataUpdated(uint256 indexed tokenId, uint256 newAmount);
@@ -189,10 +193,13 @@ contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
     /// @dev Mapping of historyId => History
     mapping(uint256 => History) private _histories;
 
+    mapping(address => uint256) private wanBalances;
+
+
     /// ------------------ EVENTS ------------------ ///
     event TokenAllowed(string symbol, address tokenAddress, uint256 price, uint8 decimals);
     event TokenDisallowed(string symbol);
-    event LiquidityAdded(address indexed user, address indexed token, uint256 amount);
+    event LiquidityAdded(address indexed user, address indexed token, uint256 amount,uint256 tokenId);
     event LiquidityRemoved(address indexed user, address indexed token, uint256 amount);
     event Swapped(
         address indexed user,
@@ -323,7 +330,10 @@ contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
         uint256 finalBalance = tokenContract.balanceOf(address(this));
         uint256 actualAmountReceived = finalBalance - initialBalance;
 
-        require(actualAmountReceived == amountWithDecimals, "Transfer amount mismatch");
+        // Allow a tolerance of 2% (i.e. require at least 98% of the expected tokens are received)
+        uint256 minimumAcceptable = (amountWithDecimals * 98) / 100;
+        require(actualAmountReceived >= minimumAcceptable, "Transfer amount mismatch");
+
 
         // Update user's liquidity mapping
         LiquidityPosition storage position = liquidityPositions[msg.sender][token.tokenAddress];
@@ -333,9 +343,10 @@ contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
         // Mint an NFT representing this liquidity
         // The minted NFT tracks the entire amount; in a real system, you might
         // want to create or update existing NFTs if you prefer one NFT per user+token.
-        liquidityNFT.mint(msg.sender, token.tokenAddress, actualAmountReceived);
+        // liquidityNFT.mint(msg.sender, token.tokenAddress, actualAmountReceived);
+            uint256 tokenId = liquidityNFT.mint(msg.sender, token.tokenAddress, actualAmountReceived);
 
-        emit LiquidityAdded(msg.sender, token.tokenAddress, actualAmountReceived);
+        emit LiquidityAdded(msg.sender, token.tokenAddress, actualAmountReceived,tokenId);
     }
 
     /**
@@ -366,17 +377,17 @@ contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
         // Update internal accounting
         position.amount -= amount;
 
-        // Optional: we also check the NFT's stored amount, then update it
-        (
-            ,
-            uint256 nftAmount,
-            ,
-        ) = liquidityNFT.getNFTInfo(nftId);
+        // // Optional: we also check the NFT's stored amount, then update it
+        // (
+        //     ,
+        //     uint256 nftAmount,
+        //     ,
+        // ) = liquidityNFT.getNFTInfo(nftId);
 
-        if (position.amount != nftAmount) {
-            // Update the NFT's metadata to reflect the new total
-            liquidityNFT.updateNFTInfo(nftId, position.amount);
-        }
+        // if (position.amount != nftAmount) {
+        //     // Update the NFT's metadata to reflect the new total
+        //     liquidityNFT.updateNFTInfo(nftId, position.amount);
+        // }
 
         // Transfer the tokens out
         IERC20 tokenContract = IERC20(token.tokenAddress);
@@ -499,8 +510,12 @@ contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
         require(address(this).balance >= outputAmount, "Insufficient WAN liquidity");
 
         // Transfer WAN out
-        (bool sent, ) = payable(msg.sender).call{value: outputAmount}("");
-        require(sent, "WAN transfer failed");
+        // payable(msg.sender).transfer(outputAmount);
+
+        Address.sendValue(payable(msg.sender), outputAmount);
+
+    
+        
 
         _recordTransactionHistory(inputSymbol, "WAN", inputAmount, outputAmount);
         emit Swapped(msg.sender, inputToken.tokenAddress, address(0), inputAmount, outputAmount);
@@ -627,4 +642,6 @@ contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
         require(sent, "Withdraw transfer failed");
         emit ETHWithdrawn(owner(), amount);
     }
+
+
 }
