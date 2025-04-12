@@ -315,6 +315,8 @@ contract ZebraSwap is Ownable, Pausable, ReentrancyGuard {
     {
         TokenInfo memory token = allowedTokens[symbol];
         require(token.isAllowed, "Token not allowed");
+        require(token.decimals <= 18, "Unsupported decimals > 18");
+
 
         IERC20 tokenContract = IERC20(token.tokenAddress);
 

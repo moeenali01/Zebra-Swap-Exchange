@@ -5,6 +5,7 @@ pragma solidity ^0.8.0;
 // 1. Imports
 //-----------------------------------------------
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
@@ -37,7 +38,7 @@ interface IWETH {
 //-----------------------------------------------
 // 2. Contract Definition
 //-----------------------------------------------
-contract Swap is ReentrancyGuard {
+contract Swap is ReentrancyGuard ,Ownable2Step {
     //-----------------------------------------------
     // 2.1 State Variables
     //-----------------------------------------------
@@ -53,10 +54,7 @@ contract Swap is ReentrancyGuard {
      */
     IUniswapV2Router public router;
 
-    /**
-     * @dev Owner of the contract; can set fees, router, WWAN address, etc.
-     */
-    address public owner;
+   
 
     /**
      * @dev Fee percentage in basis points (BPS). 
@@ -81,13 +79,7 @@ contract Swap is ReentrancyGuard {
     event RouterAddressUpdated(address indexed oldRouter, address indexed newRouter);
     event RouterWhitelisted(address indexed newRouter);
 
-    //-----------------------------------------------
-    // 2.3 Modifiers
-    //-----------------------------------------------
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Only owner");
-        _;
-    }
+  
 
     //-----------------------------------------------
     // 2.4 Constructor
@@ -99,9 +91,8 @@ contract Swap is ReentrancyGuard {
      * IMPORTANT: You must call `addApprovedRouter(...)` to whitelist 
      * a valid router, then `setRouterAddress(...)` to set it for use.
      */
-    constructor() {
-        // Owner is the contract deployer
-        owner = msg.sender;
+    constructor() Ownable(msg.sender) {
+        
 
         // Default fee = 1% (100 BPS)
         feePercentage = 100;
@@ -147,14 +138,7 @@ contract Swap is ReentrancyGuard {
         return false;
     }
 
-    /**
-     * @dev Transfers ownership to a new address. Must not be zero address.
-     */
-    function setOwner(address newOwner) external onlyOwner {
-        require(newOwner != address(0), "Owner cannot be zero");
-        emit OwnerChanged(owner, newOwner);
-        owner = newOwner;
-    }
+  
 
     /**
      * @dev Updates the WWAN token address. Must not be zero address.
@@ -249,8 +233,8 @@ contract Swap is ReentrancyGuard {
         //-----------------------------------------------
         // 5.3 Transfer fee to owner
         //-----------------------------------------------
-        require(IERC20(fromToken).transfer(owner, fee), "Fee transfer failed");
-        emit FeeCollected(owner, fee);
+        require(IERC20(fromToken).transfer(owner(), fee), "Fee transfer failed");
+        emit FeeCollected(owner(), fee);
 
         //-----------------------------------------------
         // 5.4 Slippage handling
@@ -317,9 +301,9 @@ contract Swap is ReentrancyGuard {
         //-----------------------------------------------
         // 5.2 Transfer fee to owner
         //-----------------------------------------------
-        (bool feeSent, ) = payable(owner).call{value: feeInWan}("");
+        (bool feeSent, ) = payable(owner()).call{value: feeInWan}("");
         require(feeSent, "Fee WAN transfer failed");
-        emit FeeCollected(owner, feeInWan);
+        emit FeeCollected(owner(), feeInWan);
 
         //-----------------------------------------------
         // 5.3 Wrap the remaining WAN into WWAN
